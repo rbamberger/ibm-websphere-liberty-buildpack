@@ -29,6 +29,7 @@ require 'liberty_buildpack/repository/component_index'
 require 'liberty_buildpack/repository/configured_item'
 require 'liberty_buildpack/util'
 require 'liberty_buildpack/util/cache/application_cache'
+require 'liberty_buildpack/util/app_management_utils'
 require 'liberty_buildpack/util/format_duration'
 require 'liberty_buildpack/util/properties'
 require 'liberty_buildpack/util/license_management'
@@ -123,9 +124,17 @@ module LibertyBuildpack::Container
       server_script_string = ContainerUtils.space("exec #{File.join(LIBERTY_HOME, 'bin', 'server')}")
 
       start_command = "#{create_vars_string}#{create_jdk_memory_string}#{skip_maxpermsize_string}#{java_home_string}#{wlp_user_dir_string}#{server_script_string} run #{server_name}"
+      stop_command = "#{java_home_string}#{wlp_user_dir_string}#{server_script_string} stop #{server_name}"
       move_app
 
-      start_command
+      if !LibertyBuildpack::Util::AppManagementUtils.install?
+        start_command
+      else
+        install_initial_startup_script
+        install_app_management(start_command, stop_command)
+        startup_command = File.join(LIBERTY_HOME, 'initial_startup.rb')
+        startup_command
+      end
     end
 
     private
@@ -243,7 +252,7 @@ module LibertyBuildpack::Container
           ContainerUtils.unzip(minified_zip, root)
           if File.exist? icap_extension
             extensions_dir = File.join(root, WLP_PATH, 'etc', 'extensions')
-            system("mkdir -p #{extensions_dir} && cp #{icap_extension} #{extensions_dir}")
+            system("mkdir -p #{extensions_dir}", '&&', "cp #{icap_extension} #{extensions_dir}")
           end
           system("rm -rf #{liberty_home}/lib && mv #{root}/wlp/lib #{liberty_home}/lib")
           system("rm -rf #{root}/wlp")
@@ -258,6 +267,30 @@ module LibertyBuildpack::Container
 
     def java_present?
       !@java_home.nil? && File.directory?(File.join(@app_dir, @java_home))
+    end
+
+    def install_initial_startup_script
+      resources_dir = File.expand_path(RESOURCES, File.dirname(__FILE__))
+      initial_startup_file = File.join(liberty_home, 'initial_startup.rb')
+      FileUtils.cp(File.join(resources_dir, 'initial_startup.rb'), liberty_home)
+      File.chmod(0o755, initial_startup_file)
+    end
+
+    def install_app_management(start_command, stop_command)
+      # copy the app management scripts from app_management/liberty to the droplet, then modify them copied scripts
+      source_dir = File.expand_path(APP_MANAGEMENT_PATH, File.dirname(__FILE__))
+      target_dir = File.join(@app_dir, '.app-management')
+      FileUtils.mkdir_p(target_dir)
+      FileUtils.cp_r(Dir.glob("#{source_dir}/*"), target_dir)
+      # update template values in start/stop scripts
+      start_script = File.join(target_dir, 'scripts', 'start')
+      start_command.gsub!('&', '\\\\&')
+      system "sed -i -e 's|%COMMAND%|#{start_command}|' #{start_script}"
+      File.chmod(0o755, start_script)
+      stop_script = File.join(target_dir, 'scripts', 'stop')
+      stop_command.gsub!('&', '\\\\&')
+      system "sed -i -e 's|%COMMAND%|#{stop_command}|' #{stop_script}"
+      File.chmod(0o755, stop_script)
     end
 
     def set_liberty_system_properties
@@ -285,6 +318,8 @@ module LibertyBuildpack::Container
     KEY_HTTP_PORT = 'port'.freeze
 
     RESOURCES = File.join('..', '..', '..', 'resources', 'liberty').freeze
+
+    APP_MANAGEMENT_PATH = File.join('..', '..', '..', 'resources', 'app_management', 'liberty').freeze
 
     MEMORY_RESOURCES = File.join('..', '..', '..', 'resources', 'memory').freeze
 
@@ -420,8 +455,11 @@ module LibertyBuildpack::Container
       disable_welcome_page(server_xml_doc)
       # Disable application monitoring
       disable_application_monitoring(server_xml_doc)
-      # Enable configuration (server.xml) monitoring
+      # Update configuration (server.xml) monitoring polling interval
       update_config_monitoring_polling_interval(server_xml_doc)
+
+      # Add feature managementConnector-1.0
+      # add_management_connector_feature(server_xml_doc)
 
       # Check if appstate ICAP feature can be used
       check_appstate_feature(server_xml_doc) if appstate_enabled?
@@ -435,6 +473,7 @@ module LibertyBuildpack::Container
 
     def use_liberty_springboot?
       spring_version = @environment['LIBERTY_NATIVE_SPRINGBOOT']
+      @logger.debug("use_liberty_springboot: spring_version is #{spring_version}")
       return true unless spring_version.nil?
       false
     end
@@ -463,6 +502,7 @@ module LibertyBuildpack::Container
       if endpoints.empty?
         endpoint = REXML::Element.new('httpEndpoint', server_xml_doc.root)
         endpoint.add_attribute('id', 'defaultHttpEndpoint')
+        endpoint.add_attribute('')
       else
         endpoint = endpoints[0]
         endpoints.drop(1).each { |element| element.parent.delete_element(element) }
@@ -538,8 +578,7 @@ module LibertyBuildpack::Container
 
     def appstate_enabled?
       config_enabled = @configuration['app_state'].nil? || @configuration['app_state']
-      feature_present = File.file?(icap_extension)
-      config_enabled && feature_present
+      config_enabled
     end
 
     def appstate_apps(server_xml_doc)
@@ -568,6 +607,26 @@ module LibertyBuildpack::Container
         appstate = REXML::Element.new('appstate2', server_xml_doc.root)
         appstate.add_attribute('appName', apps.join(', '))
       end
+    end
+
+    def add_management_connector_feature(server_xml_doc)
+      if File.file?(icap_extension)
+        # Add icap:managementConnector-1.0 feature
+        feature_managers = REXML::XPath.match(server_xml_doc, '/server/featureManager')
+        if feature_managers.empty?
+          feature_manager = REXML::Element.new('featureManager', server_xml_doc.root)
+        else
+          feature_manager = feature_managers[0]
+        end
+        connector_feature = REXML::Element.new('feature', feature_manager)
+        connector_feature.text = 'icap:managementConnector-1.0'
+      end
+    end
+
+    def add_droplet_yaml
+      resources = File.expand_path(RESOURCES, File.dirname(__FILE__))
+      container_root = File.expand_path('..', @app_dir)
+      FileUtils.cp(File.join(resources, 'droplet.yaml'), container_root)
     end
 
     def make_server_script_runnable
@@ -603,6 +662,15 @@ module LibertyBuildpack::Container
     # pointed to by the buildpack liberty.yml file.
     COMPONENT_LIBERTY_CORE   = 'liberty_core'.freeze
     COMPONENT_LIBERTY_EXT    = 'liberty_ext'.freeze
+    COMPONENT_LIBERTY_EE6    = 'liberty_ee6'.freeze
+    COMPONENT_LIBERTY_EE7    = 'liberty_ee7'.freeze
+    COMPONENT_LIBERTY_EE8    = 'liberty_ee8'.freeze
+
+    COMPONENT_MONTHLY_LIBERTY_CORE   = 'liberty_monthly_core'.freeze
+    COMPONENT_MONTHLY_LIBERTY_EXT    = 'liberty_monthly_ext'.freeze
+    COMPONENT_MONTHLY_LIBERTY_EE6    = 'liberty_monthly_ee6'.freeze
+    COMPONENT_MONTHLY_LIBERTY_EE7    = 'liberty_monthly_ee7'.freeze
+    COMPONENT_MONTHLY_LIBERTY_EE8    = 'liberty_monthly_ee8'.freeze
 
     def download_and_install_liberty
       # create a temporary directory where the downloaded files will be extracted to.
@@ -611,7 +679,12 @@ module LibertyBuildpack::Container
         FileUtils.mkdir_p(liberty_home)
 
         # download and extract the server to a temporary location.
-        uri = @liberty_components_and_uris[COMPONENT_LIBERTY_CORE]
+        if include_monthly_features?
+          uri = @liberty_components_and_uris[COMPONENT_MONTHLY_LIBERTY_CORE]
+        else
+          uri = @liberty_components_and_uris[COMPONENT_LIBERTY_CORE]
+        end
+
         raise 'No Liberty download defined in buildpack.' if uri.nil?
         download_and_unpack_archive(uri, root)
 
@@ -622,12 +695,13 @@ module LibertyBuildpack::Container
 
         # if the liberty feature manager and repository are not being used to install server
         # features, download the required files from the various configured locations. If the
-        # repository is being used it will install features later (after server.xml is updated).
+        # repository is being used it will install features later (after server.xml is updated)
         unless FeatureManager.enabled?(@configuration)
           # download and extract the extended server files to the same location, if required.
-          if @services_manager.requires_liberty_extensions? || configured_feature_requires_component?(COMPONENT_LIBERTY_EXT)
-            download_and_unpack_archive(uri, root) if (uri = @liberty_components_and_uris.delete(COMPONENT_LIBERTY_EXT))
-          end
+          download_and_install_ext(root)
+          # download and install an EE version
+          download_and_install_javaee(root)
+          # download and extract beta features, if required.
           # services may provide zips or esas or both. Query services to see what's needed
           # and download and install.
           install_list = InstallComponents.new
@@ -645,6 +719,89 @@ module LibertyBuildpack::Container
         # install any services client jars required.
         @services_manager.install_client_jars(@liberty_components_and_uris, current_server_dir)
       end
+    end
+
+    def download_and_install_ext(root)
+      uri = nil
+      if include_monthly_features?
+        feature = COMPONENT_MONTHLY_LIBERTY_EXT
+      else
+        feature = COMPONENT_LIBERTY_EXT
+      end
+      if use_liberty_springboot? || @services_manager.requires_liberty_extensions? || configured_feature_requires_component?(COMPONENT_LIBERTY_EXT) || configured_feature_requires_component?(COMPONENT_MONTHLY_LIBERTY_EXT)
+        download_and_unpack_archive(uri, root) if (uri = @liberty_components_and_uris.delete(feature))
+      end
+    end
+
+    def download_and_install_javaee(root)
+      uri = nil
+      if include_monthly_features?
+        feature = COMPONENT_MONTHLY_LIBERTY_EE7
+      else
+        feature = COMPONENT_LIBERTY_EE7
+      end
+      unless download_and_install_specific_javaee(root)
+        # download and extract the default EE7 server files to the same location, if required.
+        download_and_unpack_archive(uri, root) if (uri = @liberty_components_and_uris.delete(feature))
+      end
+    end
+
+    def download_and_install_specific_javaee(root)
+      server_xml = Liberty.server_xml(@app_dir)
+      ee_installed = false
+      install_ee = true if features_set? || server_xml
+      if install_ee
+        if include_monthly_features?
+          ee_installed = download_and_install_monthly_javaee(root)
+        else
+          ee_installed = download_and_install_ga_javaee(root)
+        end
+      end
+      ee_installed
+    end
+
+    def download_and_install_monthly_javaee(root)
+      uri = nil
+      # download and extract the EE6 server files to the same location, if required.
+      if configured_feature_requires_component?(COMPONENT_MONTHLY_LIBERTY_EE6)
+        download_and_unpack_archive(uri, root) if (uri = @liberty_components_and_uris.delete(COMPONENT_MONTHLY_LIBERTY_EE6))
+        ee_installed = true
+      end
+      if configured_feature_requires_component?(COMPONENT_MONTHLY_LIBERTY_EE7)
+        download_and_unpack_archive(uri, root) if (uri = @liberty_components_and_uris.delete(COMPONENT_MONTHLY_LIBERTY_EE7))
+        ee_installed = true
+      end
+      if configured_feature_requires_component?(COMPONENT_MONTHLY_LIBERTY_EE8)
+        download_and_unpack_archive(uri, root) if (uri = @liberty_components_and_uris.delete(COMPONENT_MONTHLY_LIBERTY_EE8))
+        ee_installed = true
+      end
+      ee_installed
+    end
+
+    def download_and_install_ga_javaee(root)
+      uri = nil
+      # download and extract the EE6 server files to the same location, if required.
+      if configured_feature_requires_component?(COMPONENT_LIBERTY_EE6)
+        download_and_unpack_archive(uri, root) if (uri = @liberty_components_and_uris.delete(COMPONENT_LIBERTY_EE6))
+        ee_installed = true
+      end
+      if configured_feature_requires_component?(COMPONENT_LIBERTY_EE7)
+        download_and_unpack_archive(uri, root) if (uri = @liberty_components_and_uris.delete(COMPONENT_LIBERTY_EE7))
+        ee_installed = true
+      end
+      if configured_feature_requires_component?(COMPONENT_LIBERTY_EE8)
+        download_and_unpack_archive(uri, root) if (uri = @liberty_components_and_uris.delete(COMPONENT_LIBERTY_EE8))
+        ee_installed = true
+      end
+      ee_installed
+    end
+
+    BETA_FEATURES_DOC_LINK = 'https://console.ng.bluemix.net/docs/runtimes/liberty/usingBetaFeatures.html'.freeze
+
+    def include_monthly_features?
+      monthly_env = @environment['IBM_LIBERTY_MONTHLY']
+      return true if !monthly_env.nil? && 'true'.casecmp(monthly_env) == 0
+      false
     end
 
     # is the given liberty component required ? It may be non-optional, in which
@@ -762,7 +919,7 @@ module LibertyBuildpack::Container
       install_start_time = Time.now
       # setup the command and options
       cmd = File.join(root, WLP_PATH, 'bin', 'featureManager')
-      script_string = "JAVA_HOME=\"#{@app_dir}/#{@java_home}\" JVM_ARGS="" #{cmd} install #{file.path} #{options} 2>&1"
+      script_string = system('"JAVA_HOME=\"#{@app_dir}/#{@java_home}\"', 'JVM_ARGS="" #{cmd}', 'install #{file.path} #{options} 2>&1"')
       output = `#{script_string}`
       if $CHILD_STATUS.to_i != 0
         puts 'FAILED'

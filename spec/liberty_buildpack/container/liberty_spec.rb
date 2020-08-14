@@ -30,6 +30,7 @@ module LibertyBuildpack::Container
     LIBERTY_WEBPROFILE7_DOWNLOAD_URI = 'test-liberty-webProfile7.tar.gz'.freeze
     LIBERTY_DETAILS = [LIBERTY_VERSION, { 'uri' => LIBERTY_SINGLE_DOWNLOAD_URI, 'license' => 'spec/fixtures/license.html', 'webProfile7' => LIBERTY_WEBPROFILE7_DOWNLOAD_URI }].freeze
     DISABLE_2PC_JAVA_OPT_REGEX = '-Dcom.ibm.tx.jta.disable2PC=true'.freeze
+    INSTALL_BLUEMIX_APP_MGMT = 'INSTALL_BLUEMIX_APP_MGMT'.freeze
 
     let(:application_cache) { double('ApplicationCache') }
     let(:component_index) { double('ComponentIndex') }
@@ -91,6 +92,7 @@ module LibertyBuildpack::Container
       http_dispatcher = server_xml_doc.elements['/server/httpDispatcher']
       expect(http_dispatcher).not_to be_nil
       expect(http_dispatcher.attributes['enableWelcomePage']).to eq('false')
+      expect(http_dispatcher.attributes['trustedSensitiveHeaderOrigin']).to eq('*')
 
       config = server_xml_doc.elements['/server/config']
       expect(config).not_to be_nil
@@ -1338,6 +1340,10 @@ module LibertyBuildpack::Container
         check_appstate('<application name="myapp" />', 'myapp')
       end
 
+      it 'should check the compression feature is working' do
+        check_compression_feature('<application name="myapp" />', 'myapp', '<compression/>')
+      end
+
       it 'should add appstate2 when server xml contains foo application' do
         check_appstate('<application name="foo" />', 'foo')
       end
@@ -1384,6 +1390,14 @@ module LibertyBuildpack::Container
 
     describe 'release' do
       let(:test_java_home) { 'test-java-home' }
+
+      before(:each) do
+        ENV[INSTALL_BLUEMIX_APP_MGMT] = 'FALSE'
+      end
+
+      after(:each) do
+        ENV.delete(INSTALL_BLUEMIX_APP_MGMT)
+      end
 
       context 'JVM Options' do
         def create_server_xml(path, text = 'your text')
@@ -1662,7 +1676,92 @@ module LibertyBuildpack::Container
           end.to raise_error(/Incorrect\ number\ of\ servers\ to\ deploy/)
         end
       end
-    end
+
+      it 'should return App Management release command when INSTALL_BLUEMIX_APP_MGMT is nil' do
+        LibertyBuildpack::Repository::ConfiguredItem.stub(:find_item) { |&block| block.call(LIBERTY_VERSION) if block }
+                                                    .and_return(LIBERTY_VERSION)
+
+        ENV.delete(INSTALL_BLUEMIX_APP_MGMT)
+        Dir.mktmpdir do |root|
+          FileUtils.cp_r('spec/fixtures/container_liberty_single_server', root)
+          # create the .liberty home directory. Required for test, but in reality it will exist
+          FileUtils.mkdir_p(File.join(root, 'container_liberty_single_server', '.liberty'))
+          command = Liberty.new(
+            app_dir: File.join(root, 'container_liberty_single_server'),
+            java_home: test_java_home,
+            java_opts: '',
+            configuration: {},
+            license_ids: {}
+          ).release
+
+          expect(command).to eq('.liberty/initial_startup.rb')
+          expect(Dir.exist?(File.join(root, 'container_liberty_single_server', '.app-management', 'scripts'))).to eq(true)
+          expect(File.exist?(File.join(root, 'container_liberty_single_server', '.liberty', 'initial_startup.rb'))).to eq(true)
+          start_script = File.join root, 'container_liberty_single_server', '.app-management', 'scripts', 'start'
+          stop_script = File.join root, 'container_liberty_single_server', '.app-management', 'scripts', 'stop'
+          expect(File.exist?(start_script)).to eq(true)
+          expect(File.exist?(stop_script)).to eq(true)
+          start_script_array = File.readlines(start_script).each(&:strip!)
+          start_script_contents = start_script_array.join
+          expect(start_script_contents).to include(%(JAVA_HOME="$PWD/#{test_java_home}" WLP_USER_DIR="$PWD/wlp/usr" exec .liberty/bin/server run defaultServer))
+          stop_script_array = File.readlines(stop_script).each(&:strip!)
+          stop_script_contents = stop_script_array.join
+          expect(stop_script_contents).to include(%(JAVA_HOME="$PWD/#{test_java_home}" WLP_USER_DIR="$PWD/wlp/usr" exec .liberty/bin/server stop defaultServer))
+        end
+      end
+
+      it 'should return the normal release command when INSTALL_BLUEMIX_APP_MGMT is FALSE' do
+        LibertyBuildpack::Repository::ConfiguredItem.stub(:find_item) { |&block| block.call(LIBERTY_VERSION) if block }
+                                                    .and_return(LIBERTY_VERSION)
+
+        ENV[INSTALL_BLUEMIX_APP_MGMT] = 'FALSE'
+        Dir.mktmpdir do |root|
+          FileUtils.cp_r('spec/fixtures/container_liberty_single_server', root)
+          command = Liberty.new(
+            app_dir: File.join(root, 'container_liberty_single_server'),
+            java_home: test_java_home,
+            java_opts: '',
+            configuration: {},
+            license_ids: {}
+          ).release
+
+          expect(command).to eq(".liberty/create_vars.rb wlp/usr/servers/defaultServer/runtime-vars.xml && .liberty/calculate_memory.rb && WLP_SKIP_MAXPERMSIZE=true JAVA_HOME=\"$PWD/#{test_java_home}\" WLP_USER_DIR=\"$PWD/wlp/usr\" exec .liberty/bin/server run defaultServer")
+        end
+      end
+
+      it 'should return the App Management release command when INSTALL_BLUEMIX_APP_MGMT is TRUE' do
+        LibertyBuildpack::Repository::ConfiguredItem.stub(:find_item) { |&block| block.call(LIBERTY_VERSION) if block }
+                                                    .and_return(LIBERTY_VERSION)
+
+        ENV[INSTALL_BLUEMIX_APP_MGMT] = 'TRUE'
+        Dir.mktmpdir do |root|
+          # create the .liberty home directory. Required for test, but in reality it will exist
+          FileUtils.mkdir_p(File.join(root, 'container_liberty_single_server', '.liberty'))
+          FileUtils.cp_r('spec/fixtures/container_liberty_single_server', root)
+          command = Liberty.new(
+            app_dir: File.join(root, 'container_liberty_single_server'),
+            java_home: test_java_home,
+            java_opts: '',
+            configuration: {},
+            license_ids: {}
+          ).release
+
+          expect(command).to eq('.liberty/initial_startup.rb')
+          expect(Dir.exist?(File.join(root, 'container_liberty_single_server', '.app-management', 'scripts'))).to eq(true)
+          expect(File.exist?(File.join(root, 'container_liberty_single_server', '.liberty', 'initial_startup.rb'))).to eq(true)
+          start_script = File.join root, 'container_liberty_single_server', '.app-management', 'scripts', 'start'
+          stop_script = File.join root, 'container_liberty_single_server', '.app-management', 'scripts', 'stop'
+          expect(File.exist?(start_script)).to eq(true)
+          expect(File.exist?(stop_script)).to eq(true)
+          start_script_array = File.readlines(start_script).each(&:strip!)
+          start_script_contents = start_script_array.join
+          expect(start_script_contents).to include(%(JAVA_HOME="$PWD/#{test_java_home}" WLP_USER_DIR="$PWD/wlp/usr" exec .liberty/bin/server run defaultServer))
+          stop_script_array = File.readlines(stop_script).each(&:strip!)
+          stop_script_contents = stop_script_array.join
+          expect(stop_script_contents).to include(%(JAVA_HOME="$PWD/#{test_java_home}" WLP_USER_DIR="$PWD/wlp/usr" exec .liberty/bin/server stop defaultServer))
+        end
+      end
+    end # release
 
     describe 'context root from ibm-web-ext.xml' do
 
