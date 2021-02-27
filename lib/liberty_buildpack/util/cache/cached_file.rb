@@ -33,7 +33,7 @@ module LibertyBuildpack
         # @param [String] uri a uri which uniquely identifies the file in the cache
         # @param [Boolean] mutable whether the cached file should be mutable
         def initialize(cache_root, uri, mutable)
-          key            = URI.escape(uri.sanitize_uri, ':/&')
+          key            = URI.escape(uri.sanitize_uri, ':/&') 
           key = key[0..200]
 
           @cached        = cache_root + "#{key}.cached"
@@ -42,8 +42,6 @@ module LibertyBuildpack
           @mutable       = mutable
 
           FileUtils.mkdir_p cache_root if mutable
-
-          puts "CachedFile Initialized"
         end
 
         # Opens the cached file
