@@ -35,7 +35,8 @@ module LibertyBuildpack
         def initialize(cache_root, uri, mutable)
           key            = URI.escape(uri.sanitize_uri, ':/&')
           puts "key: #{key}"
-          
+          key = key[0..200]
+
           @cached        = cache_root + "#{key}.cached"
           @etag          = cache_root + "#{key}.etag"
           @last_modified = cache_root + "#{key}.last_modified"
