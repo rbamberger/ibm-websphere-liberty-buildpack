@@ -34,7 +34,6 @@ module LibertyBuildpack
         # @param [Boolean] mutable whether the cached file should be mutable
         def initialize(cache_root, uri, mutable)
           key            = URI.escape(uri.sanitize_uri, ':/&')
-          puts "key: #{key}"
           key = key[0..200]
 
           @cached        = cache_root + "#{key}.cached"
