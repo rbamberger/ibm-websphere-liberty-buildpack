@@ -40,6 +40,8 @@ module LibertyBuildpack
           @mutable       = mutable
 
           FileUtils.mkdir_p cache_root if mutable
+
+          puts ""
         end
 
         # Opens the cached file
