@@ -16,6 +16,7 @@
 
 require 'spec_helper'
 require 'application_helper'
+require 'digest'
 require 'internet_availability_helper'
 require 'logging_helper'
 require 'fileutils'
@@ -329,7 +330,7 @@ describe LibertyBuildpack::Util::Cache::DownloadCache do
   end
 
   def cache_file(root, extension)
-    root + "http%3A%2F%2Ffoo-uri%2F.#{extension}"
+    root + "#{Digest::SHA256.hexdigest('http://foo-uri/')}.#{extension}"
   end
 
   def expect_complete_cache(root)
