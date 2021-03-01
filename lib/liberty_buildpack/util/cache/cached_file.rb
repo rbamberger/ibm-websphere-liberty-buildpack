@@ -16,6 +16,7 @@
 
 require 'fileutils'
 require 'liberty_buildpack/util/cache'
+require 'digest'
 
 module LibertyBuildpack
   module Util
